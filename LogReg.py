@@ -1,225 +1,168 @@
+#!/usr/bin/env python3
+"""
+train_logreg_absa.py
+
+Trains two logistic regression classifiers for ABSA:
+ - aspectCategory classifier (multiclass)
+ - polarity classifier (multiclass: positive/negative/neutral)
+
+Outputs:
+ - saved models (joblib): aspect_model.joblib, sentiment_model.joblib
+ - test_pred.csv with columns: id,aspectCategory,polarity
+ - prints classification reports on a held-out dev set
+"""
+
+import argparse
+import os
 import pandas as pd
 import numpy as np
-from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-import re
-import string
+from sklearn.metrics import classification_report, f1_score
+import joblib
+import warnings
+warnings.filterwarnings("ignore")
 
-def preprocess_text(text):
-    """Preprocess the text data"""
-    if isinstance(text, str):
-        # Convert to lowercase
-        text = text.lower()
-        # Remove punctuation
-        text = text.translate(str.maketrans('', '', string.punctuation))
-        # Remove extra whitespace
-        text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def load_data(path):
+    df = pd.read_csv(path)
+    # Expect columns: id, text, aspectCategory, polarity
+    required = {'id', 'text', 'aspectCategory', 'polarity'}
+    if not required.issubset(set(df.columns)):
+        raise ValueError(f"CSV must contain columns: {required}. Found: {df.columns.tolist()}")
+    return df
 
-def load_and_prepare_data(train_file, test_file):
-    """Load and prepare training and test data"""
-    # Load training data
-    train_df = pd.read_csv(train_file)
-    
-    # Load test data
-    test_df = pd.read_csv(test_file)
-    
-    print(f"Training data shape: {train_df.shape}")
-    print(f"Test data shape: {test_df.shape}")
-    
-    return train_df, test_df
+def build_text_pipeline():
+    # Tfidf on unigrams + bigrams, max_features optional
+    vect = TfidfVectorizer(lowercase=True,
+                           stop_words='english',
+                           ngram_range=(1,2),
+                           max_df=0.95,
+                           min_df=2)
+    # logistic regression with sag or liblinear depending on solver & size
+    clf = LogisticRegression(max_iter=2000, solver='saga', random_state=42, n_jobs=-1)
+    pipe = Pipeline([
+        ('tfidf', vect),
+        ('clf', clf)
+    ])
+    return pipe
 
-def train_aspect_sentiment_model(train_df):
-    """Train separate models for aspect classification and sentiment analysis"""
-    
-    # Preprocess text
-    train_df['processed_text'] = train_df['text'].apply(preprocess_text)
-    
-    # Initialize vectorizer
-    vectorizer = CountVectorizer(max_features=5000, ngram_range=(1, 2))
-    
-    # Prepare features
-    X = vectorizer.fit_transform(train_df['processed_text'])
-    
-    # Encode aspect categories
-    aspect_encoder = LabelEncoder()
-    y_aspect = aspect_encoder.fit_transform(train_df['aspectCategory'])
-    
-    # Encode sentiment
-    sentiment_encoder = LabelEncoder()
-    y_sentiment = sentiment_encoder.fit_transform(train_df['polarity'])
-    
-    # Train aspect classifier
-    print("Training aspect classifier...")
-    aspect_model = LogisticRegression(random_state=42, max_iter=1000)
-    aspect_model.fit(X, y_aspect)
-    
-    # Train sentiment classifier
-    print("Training sentiment classifier...")
-    sentiment_model = LogisticRegression(random_state=42, max_iter=1000)
-    sentiment_model.fit(X, y_sentiment)
-    
-    return {
-        'vectorizer': vectorizer,
-        'aspect_model': aspect_model,
-        'sentiment_model': sentiment_model,
-        'aspect_encoder': aspect_encoder,
-        'sentiment_encoder': sentiment_encoder
+def grid_search_train(X_train, y_train):
+    """
+    Quick grid search for C parameter; keep small grid so it runs fast.
+    """
+    pipe = build_text_pipeline()
+    param_grid = {
+        'clf__C': [0.01, 0.1, 1.0, 5.0],
+        'clf__class_weight': [None, 'balanced']
     }
+    gs = GridSearchCV(pipe, param_grid, cv=3, scoring='f1_macro', n_jobs=-1, verbose=1)
+    gs.fit(X_train, y_train)
+    print("Best params:", gs.best_params_)
+    return gs.best_estimator_
 
-def predict_on_test(test_df, model_dict):
-    """Make predictions on test data"""
-    
-    # Preprocess test text
-    test_df['processed_text'] = test_df['text'].apply(preprocess_text)
-    
-    # Prepare features
-    X_test = model_dict['vectorizer'].transform(test_df['processed_text'])
-    
-    # Make predictions
-    aspect_predictions = model_dict['aspect_model'].predict(X_test)
-    sentiment_predictions = model_dict['sentiment_model'].predict(X_test)
-    
-    # Decode predictions
-    aspect_categories = model_dict['aspect_encoder'].inverse_transform(aspect_predictions)
-    sentiment_labels = model_dict['sentiment_encoder'].inverse_transform(sentiment_predictions)
-    
-    return aspect_categories, sentiment_labels
+def train_and_save(train_csv, test_csv=None, output_dir='models', use_grid_search=True):
+    os.makedirs(output_dir, exist_ok=True)
+    df = load_data(train_csv)
 
-def create_submission_file(test_df, aspect_predictions, sentiment_predictions, output_file):
-    """Create submission file in the required format"""
-    
-    submission_df = test_df.copy()
-    submission_df['aspectCategory'] = aspect_predictions
-    submission_df['polarity'] = sentiment_predictions
-    
-    # Keep only the required columns
-    submission_df = submission_df[['id', 'text', 'aspectCategory', 'polarity']]
-    
-    # Save to CSV
-    submission_df.to_csv(output_file, index=False)
-    print(f"Submission file saved as: {output_file}")
-    
-    return submission_df
+    # If dataset contains duplicates (same id, different aspects) that's expected: each row is a sample.
+    X = df['text'].astype(str).values
+    y_aspect = df['aspectCategory'].astype(str).values
+    y_polarity = df['polarity'].astype(str).values
+    ids = df['id'].values
 
-def evaluate_on_dev_set(train_df, test_size=0.2):
-    """Evaluate model performance on development set"""
-    
-    # Preprocess text
-    train_df['processed_text'] = train_df['text'].apply(preprocess_text)
-    
-    # Split data
-    X_train, X_dev, y_train_aspect, y_dev_aspect, y_train_sentiment, y_dev_sentiment = train_test_split(
-        train_df['processed_text'], 
-        train_df['aspectCategory'], 
-        train_df['polarity'],
-        test_size=test_size, 
-        random_state=42,
-        stratify=train_df['aspectCategory']
-    )
-    
-    # Initialize vectorizer
-    vectorizer = CountVectorizer(max_features=5000, ngram_range=(1, 2))
-    X_train_vec = vectorizer.fit_transform(X_train)
-    X_dev_vec = vectorizer.transform(X_dev)
-    
-    # Encode labels
-    aspect_encoder = LabelEncoder()
-    sentiment_encoder = LabelEncoder()
-    
-    y_train_aspect_enc = aspect_encoder.fit_transform(y_train_aspect)
-    y_dev_aspect_enc = aspect_encoder.transform(y_dev_aspect)
-    
-    y_train_sentiment_enc = sentiment_encoder.fit_transform(y_train_sentiment)
-    y_dev_sentiment_enc = sentiment_encoder.transform(y_dev_sentiment)
-    
-    # Train models
-    aspect_model = LogisticRegression(random_state=42, max_iter=1000)
-    sentiment_model = LogisticRegression(random_state=42, max_iter=1000)
-    
-    aspect_model.fit(X_train_vec, y_train_aspect_enc)
-    sentiment_model.fit(X_train_vec, y_train_sentiment_enc)
-    
-    # Make predictions
-    aspect_pred = aspect_model.predict(X_dev_vec)
-    sentiment_pred = sentiment_model.predict(X_dev_vec)
-    
-    # Decode predictions
-    aspect_pred_decoded = aspect_encoder.inverse_transform(aspect_pred)
-    sentiment_pred_decoded = sentiment_encoder.inverse_transform(sentiment_pred)
-    
-    # Calculate accuracy
-    aspect_accuracy = (aspect_pred_decoded == y_dev_aspect.values).mean()
-    sentiment_accuracy = (sentiment_pred_decoded == y_dev_sentiment.values).mean()
-    
-    # Calculate overall accuracy (both aspect and sentiment correct)
-    overall_accuracy = ((aspect_pred_decoded == y_dev_aspect.values) & 
-                       (sentiment_pred_decoded == y_dev_sentiment.values)).mean()
-    
-    print("\n=== Development Set Evaluation ===")
-    print(f"Aspect Classification Accuracy: {aspect_accuracy:.4f}")
-    print(f"Sentiment Classification Accuracy: {sentiment_accuracy:.4f}")
-    print(f"Overall Accuracy (Both Correct): {overall_accuracy:.4f}")
-    
-    # Print detailed classification reports
-    print("\n=== Aspect Classification Report ===")
-    print(classification_report(y_dev_aspect, aspect_pred_decoded))
-    
-    print("\n=== Sentiment Classification Report ===")
-    print(classification_report(y_dev_sentiment, sentiment_pred_decoded))
-    
-    return overall_accuracy
+    # Split into train/dev (stratify by polarity maybe)
+    X_tr, X_dev, aspect_tr, aspect_dev, pol_tr, pol_dev = train_test_split(
+        X, y_aspect, y_polarity, test_size=0.2, random_state=42, stratify=y_polarity)
 
-def main():
-    """Main function to run the ABSA system"""
-    
-    # File paths
-    train_file = "contest1_train.csv"
-    test_file = "contest1_test.csv"
-    output_file = "test_pred.csv"
-    
-    try:
-        # Load data
-        print("Loading data...")
-        train_df, test_df = load_and_prepare_data(train_file, test_file)
-        
-        # Evaluate on development set
-        print("\nEvaluating model on development set...")
-        dev_accuracy = evaluate_on_dev_set(train_df)
-        
-        # Train final model on all training data
-        print("\nTraining final model on all training data...")
-        model_dict = train_aspect_sentiment_model(train_df)
-        
-        # Make predictions on test set
-        print("Making predictions on test set...")
-        aspect_predictions, sentiment_predictions = predict_on_test(test_df, model_dict)
-        
-        # Create submission file
-        print("Creating submission file...")
-        submission_df = create_submission_file(test_df, aspect_predictions, sentiment_predictions, output_file)
-        
-        # Print some statistics
-        print("\n=== Prediction Statistics ===")
-        print(f"Total predictions: {len(submission_df)}")
-        print(f"Aspect distribution:")
-        print(submission_df['aspectCategory'].value_counts())
-        print(f"\nSentiment distribution:")
-        print(submission_df['polarity'].value_counts())
-        
-        print(f"\nSubmission file '{output_file}' created successfully!")
-        print("Use the following command to evaluate:")
-        print(f"python evaluate.py {train_file} {output_file}")
-        print(f"python check_id.py {test_file} {output_file}")
-        
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print("Please make sure the CSV files are in the current directory")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    # Label encoders (keep for mapping)
+    le_aspect = LabelEncoder().fit(np.concatenate([aspect_tr, aspect_dev]))
+    le_polarity = LabelEncoder().fit(np.concatenate([pol_tr, pol_dev]))
 
-if __name__ == "__main__":
-    main()
+    y_aspect_tr = le_aspect.transform(aspect_tr)
+    y_aspect_dev = le_aspect.transform(aspect_dev)
+
+    y_pol_tr = le_polarity.transform(pol_tr)
+    y_pol_dev = le_polarity.transform(pol_dev)
+
+    # Train aspect classifier
+    print("\nTraining aspect classifier...")
+    if use_grid_search:
+        aspect_pipe = grid_search_train(X_tr, aspect_tr)
+    else:
+        aspect_pipe = build_text_pipeline()
+        aspect_pipe.fit(X_tr, aspect_tr)
+
+    print("\nTraining sentiment classifier...")
+    if use_grid_search:
+        sentiment_pipe = grid_search_train(X_tr, pol_tr)
+    else:
+        sentiment_pipe = build_text_pipeline()
+        sentiment_pipe.fit(X_tr, pol_tr)
+
+    # Evaluate on dev set
+    print("\nEvaluating on dev set...\n")
+    aspect_pred_dev = aspect_pipe.predict(X_dev)
+    pol_pred_dev = sentiment_pipe.predict(X_dev)
+
+    print("Aspect classification report:")
+    print(classification_report(aspect_dev, aspect_pred_dev, zero_division=0))
+    print("Polarity classification report:")
+    print(classification_report(pol_dev, pol_pred_dev, zero_division=0))
+
+    # Overall — a prediction is correct only if both match.
+    correct_both = (aspect_pred_dev == aspect_dev) & (pol_pred_dev == pol_dev)
+    overall_f1 = f1_score((aspect_dev + '||' + pol_dev), (aspect_pred_dev + '||' + pol_pred_dev), average='macro')
+    acc = correct_both.mean()
+    print(f"Dev set: combined accuracy (both must match) = {acc:.4f}")
+    print(f"Dev set: combined F1 (macro) using combined tokens = {overall_f1:.4f} (approx)")
+
+    # Save models and encoders
+    aspect_model_path = os.path.join(output_dir, 'aspect_model.joblib')
+    sentiment_model_path = os.path.join(output_dir, 'sentiment_model.joblib')
+    encoders_path = os.path.join(output_dir, 'label_encoders.joblib')
+
+    joblib.dump(aspect_pipe, aspect_model_path)
+    joblib.dump(sentiment_pipe, sentiment_model_path)
+    joblib.dump({'le_aspect': le_aspect, 'le_polarity': le_polarity}, encoders_path)
+    print(f"\nSaved aspect model -> {aspect_model_path}")
+    print(f"Saved sentiment model -> {sentiment_model_path}")
+    print(f"Saved encoders -> {encoders_path}")
+
+    # If test file provided, produce predictions
+    if test_csv is not None:
+        df_test = pd.read_csv(test_csv)
+        if 'text' not in df_test.columns or 'id' not in df_test.columns:
+            raise ValueError("Test CSV must have columns 'id' and 'text'.")
+        X_test = df_test['text'].astype(str).values
+        ids_test = df_test['id'].values
+
+        pred_aspect_test = aspect_pipe.predict(X_test)
+        pred_pol_test = sentiment_pipe.predict(X_test)
+
+        out_df = pd.DataFrame({
+            'id': ids_test,
+            'aspectCategory': pred_aspect_test,
+            'polarity': pred_pol_test
+        })
+        out_csv = os.path.join(output_dir, 'test_pred.csv')
+        out_df.to_csv(out_csv, index=False)
+        print(f"\nSaved test predictions -> {out_csv}")
+        print("Make sure to run your provided check_id.py and evaluate.py as required by the assignment.")
+
+    return aspect_pipe, sentiment_pipe, (le_aspect, le_polarity)
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train logistic regression ABSA baseline")
+    p.add_argument('--train', required=True, help='Path to training CSV with columns id,text,aspectCategory,polarity')
+    p.add_argument('--test', required=False, help='(optional) test CSV with columns id,text to predict')
+    p.add_argument('--out', default='models', help='Output folder to save models and predictions')
+    p.add_argument('--no-grid', action='store_true', help='Disable GridSearch (faster)')
+    return p.parse_args()
+
+if __name__ == '__main__':
+    args = parse_args()
+    train_and_save(args.train, test_csv=args.test, output_dir=args.out, use_grid_search=(not args.no_grid))
