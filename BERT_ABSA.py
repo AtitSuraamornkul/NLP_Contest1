@@ -10,7 +10,8 @@ import torch.nn as nn
 
 # --- Configuration ---
 MODEL_NAME = 'distilbert-base-uncased'
-TRAIN_FILE = "contest1_train.csv"
+TRAIN_FILE = "train_split.csv"
+VAL_FILE = "val_split.csv"
 TEST_FILE = "contest1_test.csv"
 OUTPUT_FILE = "test_pred.csv"
 BATCH_SIZE = 16
@@ -22,13 +23,15 @@ MAX_LEN = 128
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- Data Loading and Preprocessing ---
-def load_data(train_file, test_file):
-    """Load train and test data from CSV files."""
+def load_data(train_file, val_file, test_file):
+    """Load train, validation, and test data from CSV files."""
     train_df = pd.read_csv(train_file)
+    val_df = pd.read_csv(val_file)
     test_df = pd.read_csv(test_file)
     print(f"Training data shape: {train_df.shape}")
+    print(f"Validation data shape: {val_df.shape}")
     print(f"Test data shape: {test_df.shape}")
-    return train_df, test_df
+    return train_df, val_df, test_df
 
 def create_label_maps(df):
     """Create mappings from labels to integers and vice-versa."""
@@ -197,16 +200,14 @@ def get_predictions(model, data_loader, device):
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    train_df, test_df = load_data(TRAIN_FILE, TEST_FILE)
+    df_train, df_val, test_df = load_data(TRAIN_FILE, VAL_FILE, TEST_FILE)
     
-    # Create label maps from training data
-    aspect_map, polarity_map, inv_aspect_map, inv_polarity_map = create_label_maps(train_df)
+    # Create label maps from training and validation data to ensure all labels are seen
+    full_train_df = pd.concat([df_train, df_val])
+    aspect_map, polarity_map, inv_aspect_map, inv_polarity_map = create_label_maps(full_train_df)
 
     # Initialize tokenizer
     tokenizer = DistilBertTokenizer.from_pretrained(MODEL_NAME)
-
-    # Split training data for validation
-    df_train, df_val = train_test_split(train_df, test_size=0.1, random_state=42, stratify=train_df['aspectCategory'])
 
     train_dataset = ABSADataset(df_train, tokenizer, aspect_map, polarity_map, MAX_LEN)
     val_dataset = ABSADataset(df_val, tokenizer, aspect_map, polarity_map, MAX_LEN)
